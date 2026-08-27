@@ -21,6 +21,7 @@ import (
 
 	"github.com/asciimoo/hister/config"
 	"github.com/asciimoo/hister/files"
+	"github.com/asciimoo/hister/server/crawler"
 	"github.com/asciimoo/hister/server/document"
 	"github.com/asciimoo/hister/server/extractor"
 	"github.com/asciimoo/hister/server/extractor/sdk"
@@ -75,6 +76,18 @@ func registerEndpoints(cfg *config.Config, idx *indexer.Indexer) http.Handler {
 	}
 	if cfg.App.Profiler {
 		registerDebugEndpoints(mux, cfg, idx)
+	}
+	// Crawler stats endpoint is always available (not gated by profiler).
+	{
+		h := endpointHandler(func(c *webContext) {
+			crawler.DebugHandler()(c.Response, c.Request)
+		})
+		if cfg.App.UserHandling {
+			h = withAdminAuth(h)
+		} else if cfg.App.AccessToken != "" {
+			h = withTokenAuth(h)
+		}
+		mux.HandleFunc("GET /api/stats/crawler", createHandler(cfg, idx, h))
 	}
 	// SPA catch-all: serve index.html for any path not matched above
 	mux.HandleFunc("GET /static/", createHandler(cfg, idx, serveStatic))

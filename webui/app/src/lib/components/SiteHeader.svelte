@@ -28,6 +28,7 @@
   const addMenuItem = { label: 'Add', href: 'add', color: 'var(--hister-coral)' };
 
   const secondaryItems = [
+    { label: 'Stats', href: 'stats', color: 'var(--hister-lime)' },
     { label: 'Help', href: 'help', color: 'var(--hister-indigo)' },
     { label: 'Extractors', href: 'extractors', color: 'var(--hister-cyan)' },
     { label: 'About', href: 'about', color: 'var(--hister-teal)' },
