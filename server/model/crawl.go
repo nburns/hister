@@ -37,6 +37,12 @@ type CrawlJob struct {
 	ValidatorRules string    `gorm:"type:text" json:"validator_rules"` // JSON-encoded ValidatorRules
 	Label          string    `json:"label"`
 	Status         string    `json:"status"`
+	PagesFetched   int64     `json:"pages_fetched"`
+	BytesFetched   int64     `json:"bytes_fetched"`
+	Retries        int64     `json:"retries"`
+	BreakerTrips   int64     `json:"breaker_trips"`
+	RobotsDenials  int64     `json:"robots_denials"`
+	BudgetStops    int64     `json:"budget_stops"`
 	CreatedAt      time.Time `json:"created_at"`
 	UpdatedAt      time.Time `json:"updated_at"`
 }
@@ -50,6 +56,8 @@ type CrawlURL struct {
 	Status       string    `gorm:"not null;default:pending" json:"status"`
 	Error        string    `json:"error"`
 	ErrorCode    int       `json:"error_code"`
+	HTTPStatus   int       `json:"http_status"`    // HTTP response code; 0 if not yet fetched or network error
+	Bytes        int64     `json:"bytes"`          // response body size in bytes
 	ETag         string    `gorm:"column:etag" json:"etag"`                   // ETag from last successful fetch. Explicit column name so GORM does not derive "e_tag" from the field name.
 	LastModified string    `gorm:"column:last_modified" json:"last_modified"` // Last-Modified from last successful fetch
 	CreatedAt    time.Time `json:"created_at"`
@@ -183,7 +191,7 @@ func insertCrawlURLs(db *gorm.DB, jobID string, urls []string, depth int) error 
 func GetLastFetchedURLMeta(rawURL string) (etag, lastModified string, ok bool, err error) {
 	var cu CrawlURL
 	err = DB.Select("etag, last_modified").
-		Where("url = ? AND status = ?", rawURL, CrawlURLDone).
+		Where("url = ? AND status = ? AND http_status >= 200 AND http_status <= 299", rawURL, CrawlURLDone).
 		Order("updated_at DESC").
 		Limit(1).
 		First(&cu).Error
@@ -199,14 +207,16 @@ func GetLastFetchedURLMeta(rawURL string) (etag, lastModified string, ok bool, e
 	return cu.ETag, cu.LastModified, true, nil
 }
 
-// MarkDoneAndEnqueueLinks marks a crawl URL as done (with conditional-GET
-// metadata) and inserts all discovered child URLs in a single transaction,
-// minimising the number of SQLite commits.
-func MarkDoneAndEnqueueLinks(id uint, jobID string, links []string, depth int, etag, lastModified string) error {
+// MarkDoneAndEnqueueLinks marks a crawl URL as done (with HTTP status, byte
+// count, and conditional-GET metadata) and inserts all discovered child URLs in
+// a single transaction, minimising the number of SQLite commits.
+func MarkDoneAndEnqueueLinks(id uint, jobID string, links []string, depth int, httpStatus int, bytes int64, etag, lastModified string) error {
 	return DB.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Model(&CrawlURL{}).Where("id = ?", id).
 			Updates(map[string]any{
 				"status":        CrawlURLDone,
+				"http_status":   httpStatus,
+				"bytes":         bytes,
 				"etag":          etag,
 				"last_modified": lastModified,
 				"error":         "",
@@ -270,6 +280,51 @@ func NextPendingCrawlURL(jobID string) (*CrawlURL, error) {
 func UpdateCrawlURLStatus(id uint, status, errMsg string) error {
 	return DB.Model(&CrawlURL{}).Where("id = ?", id).
 		Updates(map[string]any{"status": status, "error": errMsg, "error_code": 0}).Error
+}
+
+// SetURLResult updates a CrawlURL's status, HTTP fields, and error in one query.
+func SetURLResult(id uint, status string, httpStatus int, bytes int64, errMsg string) error {
+	return DB.Model(&CrawlURL{}).Where("id = ?", id).
+		Updates(map[string]any{
+			"status":      status,
+			"http_status": httpStatus,
+			"bytes":       bytes,
+			"error":       errMsg,
+			"error_code":  0,
+		}).Error
+}
+
+// IncrementCrawlJobPages increments pages_fetched by 1 and bytes_fetched by bytes for a job.
+func IncrementCrawlJobPages(jobID string, bytes int64) error {
+	return DB.Model(&CrawlJob{}).Where("id = ?", jobID).
+		Updates(map[string]any{
+			"pages_fetched": gorm.Expr("pages_fetched + 1"),
+			"bytes_fetched": gorm.Expr("bytes_fetched + ?", bytes),
+		}).Error
+}
+
+// IncrementCrawlJobRetries increments the retries counter for a job.
+func IncrementCrawlJobRetries(jobID string, n int64) error {
+	return DB.Model(&CrawlJob{}).Where("id = ?", jobID).
+		Update("retries", gorm.Expr("retries + ?", n)).Error
+}
+
+// IncrementCrawlJobBreakerTrips increments the breaker_trips counter for a job.
+func IncrementCrawlJobBreakerTrips(jobID string, n int64) error {
+	return DB.Model(&CrawlJob{}).Where("id = ?", jobID).
+		Update("breaker_trips", gorm.Expr("breaker_trips + ?", n)).Error
+}
+
+// IncrementCrawlJobRobotsDenials increments the robots_denials counter for a job.
+func IncrementCrawlJobRobotsDenials(jobID string, n int64) error {
+	return DB.Model(&CrawlJob{}).Where("id = ?", jobID).
+		Update("robots_denials", gorm.Expr("robots_denials + ?", n)).Error
+}
+
+// IncrementCrawlJobBudgetStops increments the budget_stops counter for a job.
+func IncrementCrawlJobBudgetStops(jobID string, n int64) error {
+	return DB.Model(&CrawlJob{}).Where("id = ?", jobID).
+		Update("budget_stops", gorm.Expr("budget_stops + ?", n)).Error
 }
 
 func MarkCrawlURLFailed(jobID, rawURL string, errCode int, errMsg string) error {
@@ -400,25 +455,44 @@ type CrawlJobStats struct {
 	Done       int64
 	Failed     int64
 	Skipped    int64
+	Count2xx   int64
+	Count3xx   int64
+	Count4xx   int64
+	Count5xx   int64
 }
 
-// GetCrawlJobStats returns URL counts per status for the given job.
+// GetCrawlJobStats returns URL counts per status and HTTP status class for the given job.
 func GetCrawlJobStats(jobID string) (CrawlJobStats, error) {
-	type row struct {
+	type statusRow struct {
 		Status string
 		Count  int64
 	}
-	var rows []row
+	var statusRows []statusRow
 	err := DB.Model(&CrawlURL{}).
 		Select("status, count(*) as count").
 		Where("job_id = ?", jobID).
 		Group("status").
-		Scan(&rows).Error
+		Scan(&statusRows).Error
 	if err != nil {
 		return CrawlJobStats{}, err
 	}
+
+	type httpRow struct {
+		Class int64
+		Count int64
+	}
+	var httpRows []httpRow
+	err = DB.Model(&CrawlURL{}).
+		Select("(http_status / 100) as class, count(*) as count").
+		Where("job_id = ? AND http_status >= 100", jobID).
+		Group("class").
+		Scan(&httpRows).Error
+	if err != nil {
+		return CrawlJobStats{}, err
+	}
+
 	var s CrawlJobStats
-	for _, r := range rows {
+	for _, r := range statusRows {
 		switch r.Status {
 		case CrawlURLPending:
 			s.Pending = r.Count
@@ -430,6 +504,18 @@ func GetCrawlJobStats(jobID string) (CrawlJobStats, error) {
 			s.Failed = r.Count
 		case CrawlURLSkipped:
 			s.Skipped = r.Count
+		}
+	}
+	for _, r := range httpRows {
+		switch r.Class {
+		case 2:
+			s.Count2xx = r.Count
+		case 3:
+			s.Count3xx = r.Count
+		case 4:
+			s.Count4xx = r.Count
+		case 5:
+			s.Count5xx = r.Count
 		}
 	}
 	return s, nil

@@ -78,3 +78,131 @@ func TestCreateNamedCrawlJobWithURLsRejectsEmptyQueue(t *testing.T) {
 	}
 }
 
+func TestSetURLResult(t *testing.T) {
+	testutil.InitModel(t)
+
+	jobID, err := model.CreateNamedCrawlJobWithURLs(
+		"set-result-job", "https://example.com/", `{}`, "test", []string{"https://example.com/"},
+	)
+	if err != nil {
+		t.Fatalf("CreateNamedCrawlJobWithURLs() error: %v", err)
+	}
+
+	cur, err := model.NextPendingCrawlURL(jobID)
+	if err != nil || cur == nil {
+		t.Fatalf("NextPendingCrawlURL() error: %v, cur: %v", err, cur)
+	}
+
+	if err := model.SetURLResult(cur.ID, model.CrawlURLDone, 200, 1234, ""); err != nil {
+		t.Fatalf("SetURLResult() error: %v", err)
+	}
+
+	stats, err := model.GetCrawlJobStats(jobID)
+	if err != nil {
+		t.Fatalf("GetCrawlJobStats() error: %v", err)
+	}
+	if stats.Done != 1 {
+		t.Fatalf("Done = %d, want 1", stats.Done)
+	}
+	if stats.Count2xx != 1 {
+		t.Fatalf("Count2xx = %d, want 1", stats.Count2xx)
+	}
+}
+
+func TestCrawlJobIncrements(t *testing.T) {
+	testutil.InitModel(t)
+
+	jobID, err := model.CreateNamedCrawlJobWithURLs(
+		"inc-job", "https://example.com/", `{}`, "test", []string{"https://example.com/"},
+	)
+	if err != nil {
+		t.Fatalf("CreateNamedCrawlJobWithURLs() error: %v", err)
+	}
+
+	if err := model.IncrementCrawlJobPages(jobID, 500); err != nil {
+		t.Fatalf("IncrementCrawlJobPages() error: %v", err)
+	}
+	if err := model.IncrementCrawlJobPages(jobID, 250); err != nil {
+		t.Fatalf("IncrementCrawlJobPages() error: %v", err)
+	}
+	if err := model.IncrementCrawlJobRetries(jobID, 2); err != nil {
+		t.Fatalf("IncrementCrawlJobRetries() error: %v", err)
+	}
+	if err := model.IncrementCrawlJobBreakerTrips(jobID, 1); err != nil {
+		t.Fatalf("IncrementCrawlJobBreakerTrips() error: %v", err)
+	}
+	if err := model.IncrementCrawlJobRobotsDenials(jobID, 3); err != nil {
+		t.Fatalf("IncrementCrawlJobRobotsDenials() error: %v", err)
+	}
+	if err := model.IncrementCrawlJobBudgetStops(jobID, 1); err != nil {
+		t.Fatalf("IncrementCrawlJobBudgetStops() error: %v", err)
+	}
+
+	job, err := model.GetCrawlJob(jobID)
+	if err != nil || job == nil {
+		t.Fatalf("GetCrawlJob() error: %v", err)
+	}
+	if job.PagesFetched != 2 {
+		t.Fatalf("PagesFetched = %d, want 2", job.PagesFetched)
+	}
+	if job.BytesFetched != 750 {
+		t.Fatalf("BytesFetched = %d, want 750", job.BytesFetched)
+	}
+	if job.Retries != 2 {
+		t.Fatalf("Retries = %d, want 2", job.Retries)
+	}
+	if job.BreakerTrips != 1 {
+		t.Fatalf("BreakerTrips = %d, want 1", job.BreakerTrips)
+	}
+	if job.RobotsDenials != 3 {
+		t.Fatalf("RobotsDenials = %d, want 3", job.RobotsDenials)
+	}
+	if job.BudgetStops != 1 {
+		t.Fatalf("BudgetStops = %d, want 1", job.BudgetStops)
+	}
+}
+
+func TestGetCrawlJobStatsHTTPBreakdown(t *testing.T) {
+	testutil.InitModel(t)
+
+	jobID, err := model.CreateNamedCrawlJobWithURLs(
+		"http-stats-job", "https://example.com/", `{}`, "test", []string{
+			"https://example.com/a",
+			"https://example.com/b",
+			"https://example.com/c",
+			"https://example.com/d",
+		},
+	)
+	if err != nil {
+		t.Fatalf("CreateNamedCrawlJobWithURLs() error: %v", err)
+	}
+
+	// Set different HTTP statuses on each URL.
+	codes := []int{200, 301, 404, 500}
+	for _, code := range codes {
+		cur, err := model.NextPendingCrawlURL(jobID)
+		if err != nil || cur == nil {
+			t.Fatalf("NextPendingCrawlURL() error: %v cur: %v", err, cur)
+		}
+		if err := model.SetURLResult(cur.ID, model.CrawlURLDone, code, 100, ""); err != nil {
+			t.Fatalf("SetURLResult(%d) error: %v", code, err)
+		}
+	}
+
+	stats, err := model.GetCrawlJobStats(jobID)
+	if err != nil {
+		t.Fatalf("GetCrawlJobStats() error: %v", err)
+	}
+	if stats.Count2xx != 1 {
+		t.Fatalf("Count2xx = %d, want 1", stats.Count2xx)
+	}
+	if stats.Count3xx != 1 {
+		t.Fatalf("Count3xx = %d, want 1", stats.Count3xx)
+	}
+	if stats.Count4xx != 1 {
+		t.Fatalf("Count4xx = %d, want 1", stats.Count4xx)
+	}
+	if stats.Count5xx != 1 {
+		t.Fatalf("Count5xx = %d, want 1", stats.Count5xx)
+	}
+}
